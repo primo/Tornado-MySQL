@@ -11,6 +11,7 @@ from tornado.concurrent import Future
 
 from tornado_mysql import connect
 from tornado_mysql.connections import Connection
+from tornado_mysql.err import OperationalError
 
 
 log = logging.getLogger("tornado_mysql.pools")
@@ -120,7 +121,12 @@ class Pool(object):
         :return: Future of cursor
         :rtype: Future
         """
-        conn = yield self._get_conn()
+        try:
+            conn = yield self._get_conn()
+        except OperationalError:
+            self._after_close()
+            raise
+
         try:
             cur = conn.cursor(cursor)
             yield cur.execute(query, params)
@@ -141,7 +147,12 @@ class Pool(object):
         :return: Future[Transaction]
         :rtype: Future
         """
-        conn = yield self._get_conn()
+        try:
+            conn = yield self._get_conn()
+        except OperationalError:
+            self._after_close()
+            raise
+
         try:
             yield conn.begin()
         except:
