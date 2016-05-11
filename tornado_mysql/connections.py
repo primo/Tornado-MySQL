@@ -6,6 +6,7 @@ from __future__ import print_function
 from ._compat import PY2, range_type, text_type, str_type, JYTHON, IRONPYTHON
 DEBUG = False
 
+import datetime
 import errno
 from functools import partial
 import hashlib
@@ -554,7 +555,7 @@ class Connection(object):
                  connect_timeout=None, ssl=None, read_default_group=None,
                  compress=None, named_pipe=None, no_delay=False,
                  autocommit=False, db=None, passwd=None, local_infile=False,
-                 io_loop=None):
+                 io_loop=None, query_timeout=None):
         """
         Establish a connection to the MySQL database. Accepts several
         arguments:
@@ -592,6 +593,10 @@ class Connection(object):
 
         db: Alias for database. (for compatibility to MySQLdb)
         passwd: Alias for password. (for compatibility to MySQLdb)
+
+        query_timeout: Timeout before throwing an exception while
+                       executing a query. None means no timeout and
+                       0 means immediately
         """
         self.io_loop = io_loop or ioloop.IOLoop.current()
 
@@ -692,6 +697,12 @@ class Connection(object):
         self.decoders = conv
         self.sql_mode = sql_mode
         self.init_command = init_command
+
+        if query_timeout:
+            self.query_timeout = datetime.timedelta(seconds=query_timeout)
+        else:
+            self.query_timeout = None
+        self.timeout_handler = None
 
     def close(self):
         """Close the socket without sending quit message."""
@@ -807,8 +818,10 @@ class Connection(object):
             print("DEBUG: sending query:", sql)
         if isinstance(sql, text_type) and not (JYTHON or IRONPYTHON):
             sql = sql.encode(self.encoding)
+        self._add_query_timeout()
         yield self._execute_command(COMMAND.COM_QUERY, sql)
         yield self._read_query_result(unbuffered=unbuffered)
+        self._remove_query_timeout()
         raise gen.Return(self._affected_rows)
 
     @gen.coroutine
@@ -1110,6 +1123,20 @@ class Connection(object):
 
     def get_server_info(self):
         return self.server_version
+
+    def _add_query_timeout(self):
+        if self.query_timeout:
+            self.timeout_handler = \
+                self.io_loop.add_timeout(self.query_timeout,
+                                         self._close_socket_on_timeout)
+
+    def _remove_query_timeout(self):
+        if self.timeout_handler:
+            self.io_loop.remove_timeout(self.timeout_handler)
+
+    def _close_socket_on_timeout(self):
+        exc = iostream.StreamClosedError("Query timeout")
+        self._stream.close(exc_info=(None, exc, None))
 
     Warning = Warning
     Error = Error
