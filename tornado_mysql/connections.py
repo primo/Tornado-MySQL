@@ -10,6 +10,9 @@ import errno
 from functools import partial
 import hashlib
 import io
+from tornado import gen, ioloop, iostream
+from tornado.netutil import Resolver
+from tornado.tcpclient import _Connector
 import os
 import socket
 import struct
@@ -35,7 +38,6 @@ try:
 except ImportError:
     DEFAULT_USER = None
 
-from tornado import gen, ioloop, iostream
 
 from .charset import MBLENGTH, charset_by_name, charset_by_id
 from .cursors import Cursor
@@ -458,6 +460,50 @@ class LoadLocalPacketWrapper(object):
         return getattr(self.packet, key)
 
 
+class LBConnector(object):
+    """ Adds support for sequential search for live LB to IOStream.
+    Uses socket.create_connection to perform it - sequential approach.
+    """
+
+    def __init__(self, io_loop):
+        self.io_loop = io_loop
+        # Default blocking resolver calling socket.getaddrinfo
+        self.resolver = Resolver(io_loop=io_loop)
+        self._own_resolver = True
+
+    def close(self):
+        self.resolver.close()
+
+    @gen.coroutine
+    def connect(self, host, port, timeout, af=socket.AF_UNSPEC,
+                max_buffer_size=None):
+        """Connect to the given host and port.
+
+        Asynchronously returns an `.IOStream`.
+        """
+        addrinfo = yield self.resolver.resolve(host, port, af)
+        connector = _Connector(
+            addrinfo, self.io_loop,
+            partial(self._create_stream, max_buffer_size))
+
+        af, addr, stream = yield connector.start(timeout)
+        # TODO: For better performance we could cache the (af, addr)
+        # information here and re-use it on subsequent connections to
+        # the same host. (http://tools.ietf.org/html/rfc6555#section-4.2)
+
+        # TODO: support ssl; it can be copied from tornado but we need to
+        # read ssl opts from Connection
+        raise gen.Return(stream)
+
+    def _create_stream(self, max_buffer_size, af, addr):
+        sock = socket.socket(af)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        stream = iostream.IOStream(sock,
+                                   io_loop=self.io_loop,
+                                   max_buffer_size=max_buffer_size)
+        return stream.connect(addr)
+
+
 class Connection(object):
     """
     Representation of a socket with a mysql server.
@@ -468,6 +514,7 @@ class Connection(object):
 
     #: :type: tornado.iostream.IOStream
     _stream = None
+    _INITIAL_CONNECT_TIMEOUT = 0.3
 
     def __init__(self, host="localhost", user=None, password="",
                  database=None, port=3306, unix_socket=None,
@@ -599,7 +646,10 @@ class Connection(object):
         self.client_flag = client_flag
 
         self.cursorclass = cursorclass
+
         self.connect_timeout = connect_timeout
+        if not self.connect_timeout:
+            self.connect_timeout = self._INITIAL_CONNECT_TIMEOUT
 
         self._result = None
         self._affected_rows = 0
@@ -783,14 +833,16 @@ class Connection(object):
                 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 addr = self.unix_socket
                 self.host_info = "Localhost via UNIX socket: " + self.unix_socket
+                stream = iostream.IOStream(sock)
+                yield stream.connect(addr)
             else:
-                sock = socket.socket()
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                addr = (self.host, self.port)
                 self.host_info = "socket %s:%d" % (self.host, self.port)
-            stream = iostream.IOStream(sock)
-            # TODO: handle connect_timeout
-            yield stream.connect(addr)
+                connector = LBConnector(self.io_loop)
+                stream = yield connector.connect(self.host,
+                                                 self.port,
+                                                 timeout=self.connect_timeout)
+                connector.close()
+
             self._stream = stream
 
             if self.no_delay:
