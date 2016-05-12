@@ -14,6 +14,7 @@ from tornado import gen, ioloop, iostream
 from tornado.netutil import Resolver
 from tornado.tcpclient import _Connector
 import os
+import random
 import socket
 import struct
 import sys
@@ -460,6 +461,35 @@ class LoadLocalPacketWrapper(object):
         return getattr(self.packet, key)
 
 
+class _RandomConnector(_Connector):
+    """A stateless implementation of the "Happy Eyeballs" algorithm.
+
+    In this implementation, we partition the addresses by family, shuffle
+    addreses in each family as returned by _Connector, and then proceed to
+    try connections in order.
+
+    """
+
+    @staticmethod
+    def split(addrinfo):
+        """Partition the ``addrinfo`` list by address family.
+
+        Returns two lists.  The first list contains the first entry from
+        ``addrinfo`` and all others with the same family, and the
+        second list contains all other addresses (normally one list will
+        be AF_INET and the other AF_INET6, although non-standard resolvers
+        may return additional families).
+
+        Each list is shuffled before returning to achieve better average
+        case time behavior in case of server outage and to load balance
+        traffic across all returned servers.
+        """
+        primary, secondary = super(_RandomConnector, _RandomConnector).split(addrinfo)
+        random.shuffle(primary)
+        random.shuffle(secondary)
+        return primary, secondary
+
+
 class LBConnector(object):
     """ Adds support for sequential search for live LB to IOStream.
     Uses socket.create_connection to perform it - sequential approach.
@@ -482,7 +512,7 @@ class LBConnector(object):
         Asynchronously returns an `.IOStream`.
         """
         addrinfo = yield self.resolver.resolve(host, port, af)
-        connector = _Connector(
+        connector = _RandomConnector(
             addrinfo, self.io_loop,
             partial(self._create_stream, max_buffer_size))
 
