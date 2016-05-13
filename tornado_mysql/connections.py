@@ -3,6 +3,7 @@
 # Error codes:
 # http://dev.mysql.com/doc/refman/5.5/en/error-messages-client.html
 from __future__ import print_function
+from tornado.concurrent import Future
 from ._compat import PY2, range_type, text_type, str_type, JYTHON, IRONPYTHON
 DEBUG = False
 
@@ -10,7 +11,11 @@ import errno
 from functools import partial
 import hashlib
 import io
+from tornado import gen, ioloop, iostream
+from tornado.netutil import Resolver
+from tornado.tcpclient import _Connector
 import os
+import random
 import socket
 import struct
 import sys
@@ -35,7 +40,6 @@ try:
 except ImportError:
     DEFAULT_USER = None
 
-from tornado import gen, ioloop, iostream
 
 from .charset import MBLENGTH, charset_by_name, charset_by_id
 from .cursors import Cursor
@@ -458,6 +462,107 @@ class LoadLocalPacketWrapper(object):
         return getattr(self.packet, key)
 
 
+class _RandomConnector(_Connector):
+    """A stateless implementation of the "Happy Eyeballs" algorithm.
+
+    In this implementation, we partition the addresses by family, shuffle
+    addreses in each family as returned by _Connector, and then proceed to
+    try connections in order.
+
+    """
+
+    @staticmethod
+    def split(addrinfo):
+        """Partition the ``addrinfo`` list by address family.
+
+        Returns two lists.  The first list contains the first entry from
+        ``addrinfo`` and all others with the same family, and the
+        second list contains all other addresses (normally one list will
+        be AF_INET and the other AF_INET6, although non-standard resolvers
+        may return additional families).
+
+        Each list is shuffled before returning to achieve better average
+        case time behavior in case of server outage and to load balance
+        traffic across all returned servers.
+        """
+        primary, secondary = super(_RandomConnector, _RandomConnector).split(addrinfo)
+        random.shuffle(primary)
+        random.shuffle(secondary)
+        return primary, secondary
+
+
+class LBConnector(object):
+    """ Adds support for sequential search for live LB to IOStream.
+    Uses socket.create_connection to perform it - sequential approach.
+    """
+
+    def __init__(self, io_loop):
+        self.io_loop = io_loop
+        # Default blocking resolver calling socket.getaddrinfo
+        self.resolver = Resolver(io_loop=io_loop)
+        self._own_resolver = True
+
+    def close(self):
+        self.resolver.close()
+
+    @gen.coroutine
+    def connect(self, host, port, timeout, af=socket.AF_UNSPEC,
+                max_buffer_size=None):
+        """Connect to the given host and port.
+
+        Asynchronously returns an `.IOStream`.
+        """
+        addrinfo = yield self.resolver.resolve(host, port, af)
+        connector = _RandomConnector(
+            addrinfo, self.io_loop,
+            partial(self._create_stream, max_buffer_size, timeout))
+
+        # Use large timeout for connection search, assume that all addresses
+        # apart from the last will timeout
+        total_connect_timeout = len(addrinfo) * timeout
+        af, addr, stream = yield connector.start(total_connect_timeout)
+
+        # TODO: For better performance we could cache the (af, addr)
+        # information here and re-use it on subsequent connections to
+        # the same host. (http://tools.ietf.org/html/rfc6555#section-4.2)
+
+        # TODO: support ssl; it can be copied from tornado but we need to
+        # read ssl opts from Connection
+        raise gen.Return(stream)
+
+    def _create_stream(self, max_buffer_size, timeout, af, addr):
+        sock = socket.socket(af)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        future = Future()
+        stream = iostream.IOStream(sock,
+                                   io_loop=self.io_loop,
+                                   max_buffer_size=max_buffer_size)
+
+        def on_stream_connect_timeout():
+            """ Close the stream and pass an exception to caller """
+            stream.set_close_callback(None)
+            exc = iostream.StreamClosedError("Connect timeout")
+            stream.close(exc_info=(None, exc, None))
+            future.set_exception(exc)
+
+        def on_stream_connected():
+            """ On success clean after ourselves """
+            self.io_loop.remove_timeout(handler)
+            stream.set_close_callback(None)
+            future.set_result(stream)
+
+        def on_stream_error():
+            """ Stream close while connecting means it failed
+            Cancel the timeout and pass the error to caller """
+            self.io_loop.remove_timeout(handler)
+            future.set_exception(stream.error)
+
+        handler = self.io_loop.add_timeout(timeout, on_stream_connect_timeout)
+        stream.set_close_callback(on_stream_error)
+        stream.connect(addr, callback=on_stream_connected)
+        return future
+
+
 class Connection(object):
     """
     Representation of a socket with a mysql server.
@@ -468,6 +573,7 @@ class Connection(object):
 
     #: :type: tornado.iostream.IOStream
     _stream = None
+    _INITIAL_CONNECT_TIMEOUT = 0.3
 
     def __init__(self, host="localhost", user=None, password="",
                  database=None, port=3306, unix_socket=None,
@@ -599,7 +705,10 @@ class Connection(object):
         self.client_flag = client_flag
 
         self.cursorclass = cursorclass
+
         self.connect_timeout = connect_timeout
+        if not self.connect_timeout:
+            self.connect_timeout = self._INITIAL_CONNECT_TIMEOUT
 
         self._result = None
         self._affected_rows = 0
@@ -783,14 +892,16 @@ class Connection(object):
                 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 addr = self.unix_socket
                 self.host_info = "Localhost via UNIX socket: " + self.unix_socket
+                stream = iostream.IOStream(sock)
+                yield stream.connect(addr)
             else:
-                sock = socket.socket()
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                addr = (self.host, self.port)
                 self.host_info = "socket %s:%d" % (self.host, self.port)
-            stream = iostream.IOStream(sock)
-            # TODO: handle connect_timeout
-            yield stream.connect(addr)
+                connector = LBConnector(self.io_loop)
+                stream = yield connector.connect(self.host,
+                                                 self.port,
+                                                 timeout=self.connect_timeout)
+                connector.close()
+
             self._stream = stream
 
             if self.no_delay:
