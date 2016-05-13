@@ -3,16 +3,17 @@
 # Error codes:
 # http://dev.mysql.com/doc/refman/5.5/en/error-messages-client.html
 from __future__ import print_function
-from tornado.concurrent import Future
 from ._compat import PY2, range_type, text_type, str_type, JYTHON, IRONPYTHON
 DEBUG = False
 
 import datetime
 import errno
+from datetime import timedelta
 from functools import partial
 import hashlib
 import io
 from tornado import gen, ioloop, iostream
+from tornado.concurrent import Future
 from tornado.netutil import Resolver
 from tornado.tcpclient import _Connector
 import os
@@ -520,7 +521,7 @@ class LBConnector(object):
 
         # Use large timeout for connection search, assume that all addresses
         # apart from the last will timeout
-        total_connect_timeout = len(addrinfo) * timeout
+        total_connect_timeout = (len(addrinfo) + 1) * timeout
         af, addr, stream = yield connector.start(total_connect_timeout)
 
         # TODO: For better performance we could cache the (af, addr)
@@ -558,6 +559,7 @@ class LBConnector(object):
             self.io_loop.remove_timeout(handler)
             future.set_exception(stream.error)
 
+        timeout = timedelta(seconds=timeout)
         handler = self.io_loop.add_timeout(timeout, on_stream_connect_timeout)
         stream.set_close_callback(on_stream_error)
         stream.connect(addr, callback=on_stream_connected)
