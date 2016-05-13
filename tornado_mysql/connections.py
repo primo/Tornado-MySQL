@@ -3,6 +3,7 @@
 # Error codes:
 # http://dev.mysql.com/doc/refman/5.5/en/error-messages-client.html
 from __future__ import print_function
+from tornado.concurrent import Future
 from ._compat import PY2, range_type, text_type, str_type, JYTHON, IRONPYTHON
 DEBUG = False
 
@@ -515,7 +516,7 @@ class LBConnector(object):
         addrinfo = yield self.resolver.resolve(host, port, af)
         connector = _RandomConnector(
             addrinfo, self.io_loop,
-            partial(self._create_stream, max_buffer_size))
+            partial(self._create_stream, max_buffer_size, timeout))
 
         af, addr, stream = yield connector.start(timeout)
         # TODO: For better performance we could cache the (af, addr)
@@ -526,13 +527,37 @@ class LBConnector(object):
         # read ssl opts from Connection
         raise gen.Return(stream)
 
-    def _create_stream(self, max_buffer_size, af, addr):
+    def _create_stream(self, max_buffer_size, timeout, af, addr):
         sock = socket.socket(af)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        future = Future()
         stream = iostream.IOStream(sock,
                                    io_loop=self.io_loop,
                                    max_buffer_size=max_buffer_size)
-        return stream.connect(addr)
+
+        def on_stream_connect_timeout():
+            """ Close the stream and pass an exception to caller """
+            stream.set_close_callback(None)
+            exc = iostream.StreamClosedError("Connect timeout")
+            stream.close(exc_info=(None, exc, None))
+            future.set_exception(exc)
+
+        def on_stream_connected():
+            """ On success clean after ourselves """
+            self.io_loop.remove_timeout(handler)
+            stream.set_close_callback(None)
+            future.set_result(stream)
+
+        def on_stream_error():
+            """ Stream close while connecting means it failed
+            Cancel the timeout and pass the error to caller """
+            self.io_loop.remove_timeout(handler)
+            future.set_exception(stream.error)
+
+        handler = self.io_loop.add_timeout(timeout, on_stream_connect_timeout)
+        stream.set_close_callback(on_stream_error)
+        stream.connect(addr, callback=on_stream_connected)
+        return future
 
 
 class Connection(object):
